@@ -1,0 +1,29 @@
+# data (too large / gated for git — document acquisition instead)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+*.csv
+!docs/**/*.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# jupyter
+.ipynb_checkpoints/
+
+# node
+node_modules/
+frontend/build/
+frontend/dist/
+
+# env / secrets
+.env
+*.local
+
+# os
+.DS_Store
