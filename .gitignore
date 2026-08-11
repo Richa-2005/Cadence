@@ -1,8 +1,8 @@
 # data (too large / gated for git — document acquisition instead)
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
+src/data/raw/*
+!src/data/raw/.gitkeep
+src/data/processed/*
+!src/data/processed/.gitkeep
 *.csv
 !docs/**/*.csv
 
