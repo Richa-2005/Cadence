@@ -109,13 +109,37 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- resume support ---
+    # Track which participant files have already been fully written into a
+    # completed shard, so a re-run after an interruption skips them instead
+    # of reprocessing from scratch. Manifest lives next to the shards.
+    manifest_path = args.output_dir / "_processed_files.txt"
+    already_done = set()
+    if manifest_path.exists():
+        already_done = set(manifest_path.read_text().splitlines())
+        print(f"Resuming: {len(already_done)} files already processed, skipping them")
+        files = [f for f in files if f.name not in already_done]
+        print(f"{len(files)} files remaining")
+
+    # Start shard numbering after the highest existing shard, so we never
+    # overwrite prior output.
+    existing_shards = sorted(args.output_dir.glob("aalto_shard_*.npz"))
+    start_shard_idx = 0
+    if existing_shards:
+        last_num = int(existing_shards[-1].stem.split("_")[-1])
+        start_shard_idx = last_num + 1
+        print(f"Continuing shard numbering from {start_shard_idx:04d}")
+
+    manifest_file = open(manifest_path, "a")
+
     buf_subject, buf_sample, buf_session = [], [], []
     buf_seqlen, buf_feat, buf_mask = [], [], []
-    shard_idx = 0
+    buf_source_files = []  # participant files contributing to current shard buffer
+    shard_idx = start_shard_idx
     total_samples = 0
 
     def flush_shard():
-        nonlocal shard_idx, buf_subject, buf_sample, buf_session, buf_seqlen, buf_feat, buf_mask
+        nonlocal shard_idx, buf_subject, buf_sample, buf_session, buf_seqlen, buf_feat, buf_mask, buf_source_files
         if not buf_subject:
             return
         out_path = args.output_dir / f"aalto_shard_{shard_idx:04d}.npz"
@@ -129,11 +153,18 @@ def main():
             mask=np.stack(buf_mask),
         )
         print(f"  wrote {out_path} ({len(buf_subject)} samples)")
+        # Mark every source file that contributed to this shard as done,
+        # and flush to disk immediately so a crash right after doesn't lose it.
+        for fname in buf_source_files:
+            manifest_file.write(fname + "\n")
+        manifest_file.flush()
         shard_idx += 1
         buf_subject, buf_sample, buf_session = [], [], []
         buf_seqlen, buf_feat, buf_mask = [], [], []
+        buf_source_files = []
 
     for fpath in tqdm(files, desc="Parsing participant files"):
+        file_had_samples = False
         for subject_id, sample_id, session, seq_len, feat, mask in parse_one_file(fpath):
             buf_subject.append(subject_id)
             buf_sample.append(sample_id)
@@ -142,11 +173,20 @@ def main():
             buf_feat.append(feat)
             buf_mask.append(mask)
             total_samples += 1
+            file_had_samples = True
             if len(buf_subject) >= args.shard_size:
                 flush_shard()
+        # Record this file as done even if it contributed 0 samples (e.g. it
+        # was unreadable) so we don't retry known-bad files on resume.
+        buf_source_files.append(fpath.name)
+        if not file_had_samples:
+            manifest_file.write(fpath.name + "\n")
+            manifest_file.flush()
+            buf_source_files.pop()  # already written directly above
 
     flush_shard()  # final partial shard
-    print(f"\nDone. Total samples: {total_samples}, shards: {shard_idx}")
+    manifest_file.close()
+    print(f"\nDone. Total samples so far: {total_samples}, shards written this run: {shard_idx - start_shard_idx}")
 
 
 if __name__ == "__main__":
