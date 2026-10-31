@@ -60,6 +60,29 @@ class PairPipelineTests(unittest.TestCase):
             self.assertEqual(store.get(i)['features'][0, 0], expected)
             self.assertLessEqual(len(store._cache), 1)
 
+    def test_memory_matches_cache_across_shards(self):
+        cached = PairDataset(self.index, pairs_per_epoch=32, cache_size=1)
+        memory = PairDataset(self.index, pairs_per_epoch=32, loading='memory')
+        self.assertEqual(memory.store.arrays['features'].shape, (4, 70, 3))
+        self.assertGreater(memory.store.nbytes, 0)
+        for epoch in (0, 1):
+            cached.set_epoch(epoch)
+            memory.set_epoch(epoch)
+            for i in range(32):
+                a, b = cached[i], memory[i]
+                self.assertEqual(a['sample_id_a'], b['sample_id_a'])
+                self.assertEqual(a['sample_id_b'], b['sample_id_b'])
+                self.assertTrue(torch.equal(a['label'], b['label']))
+                for side in ('a', 'b'):
+                    for key in ('features', 'mask', 'length'):
+                        self.assertTrue(torch.equal(a[side][key], b[side][key]))
+        # Returned tensors cannot mutate the backing arrays.
+        sample = memory.store.get(0)
+        sample['features'].fill_(999)
+        self.assertFalse((memory.store.get(0)['features'] == 999).any())
+        with self.assertRaises(ValueError):
+            PairDataset(self.index, loading='unknown')
+
     def test_rejects_bad_evaluation_pairs(self):
         for rows in ([('a_0', 'c_0', 0)], [('a_0', 'a_0', 1)],
                      [('a_0', 'b_0', 1)], [('a_0', 'b_0', 3)]):

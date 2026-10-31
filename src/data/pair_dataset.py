@@ -1,7 +1,7 @@
 """
 PyTorch pair datasets shared by local CMU and Kaggle Aalto runs.
 Labels: 1 = genuine, 0 = impostor. Features remain in raw seconds.
-Each worker keeps its own bounded cache of decompressed NPZ shards.
+Choose a bounded shard cache or preload the selected split into RAM.
 """
 from collections import OrderedDict
 from pathlib import Path
@@ -38,11 +38,50 @@ class FeatureStore:
                 self._cache[shard] = {key: data[key] for key in ("features", "mask", "seq_len")}
         self._cache.move_to_end(shard)
         arrays = self._cache[shard]
-        return {
-            "features": torch.from_numpy(arrays["features"][row].copy()).float(),
-            "mask": torch.from_numpy(arrays["mask"][row].copy()).bool(),
-            "length": torch.tensor(int(arrays["seq_len"][row]), dtype=torch.long),
-        }
+        return sample_tensors(arrays, row)
+
+
+def sample_tensors(arrays, row):
+    return {
+        "features": torch.from_numpy(arrays["features"][row].copy()).float(),
+        "mask": torch.from_numpy(arrays["mask"][row].copy()).bool(),
+        "length": torch.tensor(int(arrays["seq_len"][row]), dtype=torch.long),
+    }
+
+
+class InMemoryFeatureStore:
+    """Decompress each relevant shard once and retain only this split's rows.
+
+    Allocate final arrays first and fill shard by shard to avoid concatenating
+    a second full copy. Use num_workers=0 to avoid worker copies of these arrays.
+    """
+
+    def __init__(self, index: PairIndex):
+        self.arrays = {}
+        count = len(index.sample_ids)
+        if count == 0:
+            raise ValueError("Cannot preload an empty split")
+        for shard, path in enumerate(index.shard_paths):
+            destinations = np.flatnonzero(index.shard_indices == shard)
+            if not len(destinations):
+                continue
+            rows = index.row_indices[destinations]
+            with np.load(path, allow_pickle=True) as data:
+                for key in ("features", "mask", "seq_len"):
+                    source = data[key]
+                    if key not in self.arrays:
+                        self.arrays[key] = np.empty((count, *source.shape[1:]), dtype=source.dtype)
+                    target = self.arrays[key]
+                    if source.shape[1:] != target.shape[1:] or source.dtype != target.dtype:
+                        raise ValueError(f"Inconsistent {key} shape or dtype in {path}")
+                    target[destinations] = source[rows]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(array.nbytes for array in self.arrays.values())
+
+    def get(self, sample_index: int) -> dict[str, torch.Tensor]:
+        return sample_tensors(self.arrays, sample_index)
 
 
 class PairDataset(Dataset):
@@ -56,7 +95,8 @@ class PairDataset(Dataset):
 
     def __init__(self, index: PairIndex, *, pairs_per_epoch: int = 10000,
                  seed: int = 42, fixed_pairs_path: Path | None = None,
-                 cache_size: int = 2, split_name: str = "train"):
+                 cache_size: int = 2, split_name: str = "train",
+                 loading: str = "cached"):
         if split_name not in {"train", "val", "test"}:
             raise ValueError("Unknown split")
         if split_name != "train" and fixed_pairs_path is None:
@@ -66,7 +106,8 @@ class PairDataset(Dataset):
         if pairs_per_epoch < 1 or seed < 0:
             raise ValueError("pairs_per_epoch must be positive and seed non-negative")
         self.index = index
-        self.store = FeatureStore(index, cache_size)
+        if loading not in {"cached", "memory"}:
+            raise ValueError("loading must be 'cached' or 'memory'")
         self.seed, self.epoch = seed, 0
         self.pairs = None
         self.size = pairs_per_epoch
@@ -93,6 +134,10 @@ class PairDataset(Dataset):
                 self.size = len(labels)
         elif len(index.subjects) < 2 or not index.genuine_subjects:
             raise ValueError("Training requires two subjects and eligible genuine pairs")
+
+        # Validate pair metadata before allocating potentially large arrays.
+        self.store = (InMemoryFeatureStore(index) if loading == "memory"
+                      else FeatureStore(index, cache_size))
 
     def set_epoch(self, epoch: int) -> None:
         if epoch < 0:
