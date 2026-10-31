@@ -12,6 +12,12 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
+# Support both `python -m src.data.pair_generation` and the original script CLI.
+if __package__:
+    from .validity import valid_sequences, check_lengths, POLICY
+else:
+    from validity import valid_sequences, check_lengths, POLICY
+
 
 @dataclass(frozen=True)
 class PairIndex:
@@ -25,6 +31,11 @@ class PairIndex:
     row_indices: np.ndarray
     sessions: np.ndarray
     cross_session: bool = False
+    split_name: str | None = None
+    dataset: str | None = None
+    validity_policy: str | None = None
+    excluded_samples: int = 0
+    subjects_without_valid_samples: tuple[str, ...] = ()
 
     @cached_property
     def subjects(self) -> tuple[str, ...]:
@@ -87,12 +98,13 @@ def load_pair_index(
     processed_dir: Path = DEFAULT_PROCESSED_DIR,
     split_path: Path | None = None,
     cross_session: bool | None = None,
+    filter_invalid: bool = True,
 ) -> PairIndex:
     """
     Load only sample_id/subject_id metadata for one split.
 
-    This intentionally does not load features. Training code can keep this map
-    in memory and use the returned sample indices to fetch features separately.
+    Features are scanned shard by shard for validity, then discarded.
+    Only eligible sample metadata is retained; subject assignments do not change.
     """
     if split_name not in {"train", "val", "test"}:
         raise ValueError("split_name must be one of: train, val, test")
@@ -106,17 +118,26 @@ def load_pair_index(
 
     paths = tuple(dataset_npz_paths(dataset, processed_dir))
     shard_indices, row_indices, sessions = [], [], []
+    seen_subjects = set()
+    excluded_samples = 0
     for shard_idx, npz_path in enumerate(paths):
         with np.load(npz_path, allow_pickle=True) as data:
             shard_subjects = data["subject_id"].astype(str)
             shard_sample_ids = data["sample_id"].astype(str)
             keep = np.flatnonzero(np.isin(shard_subjects, list(split_subjects)))
+            seen_subjects.update(shard_subjects[keep].tolist())
+            if filter_invalid and len(keep):
+                mask = data["mask"][keep].astype(bool)
+                check_lengths(mask, data["seq_len"][keep])
+                eligible = valid_sequences(data["features"][keep], mask)
+                excluded_samples += int((~eligible).sum())
+                keep = keep[eligible]
             sample_ids.extend(shard_sample_ids[keep].tolist())
             subject_ids.extend(shard_subjects[keep].tolist())
             shard_indices.extend([shard_idx] * len(keep))
             row_indices.extend(keep.tolist())
             sessions.extend(data["session"][keep].tolist())
-    if set(subject_ids) != split_subjects:
+    if seen_subjects != split_subjects:
         raise ValueError("Split references subjects missing from the processed data")
     if len(set(sample_ids)) != len(sample_ids):
         raise ValueError("Duplicate sample IDs in processed data")
@@ -134,7 +155,9 @@ def load_pair_index(
     return PairIndex(sample_ids_arr, subject_ids_arr, frozen_subject_to_indices,
                      paths, np.asarray(shard_indices, dtype=np.int32),
                      np.asarray(row_indices, dtype=np.int64), np.asarray(sessions),
-                     dataset == "cmu" if cross_session is None else cross_session)
+                     dataset == "cmu" if cross_session is None else cross_session,
+                     split_name, dataset, POLICY if filter_invalid else None,
+                     excluded_samples, tuple(sorted(split_subjects - set(subject_ids))))
 
 
 def sample_genuine_pair(index: PairIndex, rng: np.random.Generator) -> tuple[int, int]:
@@ -244,6 +267,9 @@ def main() -> None:
     print(f"Split: {args.split_name}")
     print(f"Subjects: {len(index.subject_to_indices)}")
     print(f"Samples: {len(index.sample_ids)}")
+    print(f"Excluded invalid samples: {index.excluded_samples}")
+    print(f"Subjects without valid samples: {len(index.subjects_without_valid_samples)}")
+    print(f"Subjects eligible for genuine pairs: {len(index.genuine_subjects)}")
     print(f"Genuine pairs: {n_genuine}")
     print(f"Impostor pairs: {n_impostor}")
     print(f"Wrote pairs -> {out_path}")

@@ -1,6 +1,6 @@
 """
 PyTorch pair datasets shared by local CMU and Kaggle Aalto runs.
-Labels: 1 = genuine, 0 = impostor. Features remain in raw seconds.
+Labels: 1 = genuine, 0 = impostor. Optional saved normalizer transforms raw seconds.
 Choose a bounded shard cache or preload the selected split into RAM.
 """
 from collections import OrderedDict
@@ -96,7 +96,7 @@ class PairDataset(Dataset):
     def __init__(self, index: PairIndex, *, pairs_per_epoch: int = 10000,
                  seed: int = 42, fixed_pairs_path: Path | None = None,
                  cache_size: int = 2, split_name: str = "train",
-                 loading: str = "cached"):
+                 loading: str = "cached", normalizer=None):
         if split_name not in {"train", "val", "test"}:
             raise ValueError("Unknown split")
         if split_name != "train" and fixed_pairs_path is None:
@@ -106,6 +106,7 @@ class PairDataset(Dataset):
         if pairs_per_epoch < 1 or seed < 0:
             raise ValueError("pairs_per_epoch must be positive and seed non-negative")
         self.index = index
+        self.normalizer = normalizer
         if loading not in {"cached", "memory"}:
             raise ValueError("loading must be 'cached' or 'memory'")
         self.seed, self.epoch = seed, 0
@@ -157,8 +158,13 @@ class PairDataset(Dataset):
             label = int(rng.integers(2))
             sampler = sample_genuine_pair if label else sample_impostor_pair
             a, b = sampler(self.index, rng)
+        sample_a, sample_b = self.store.get(a), self.store.get(b)
+        if self.normalizer is not None:
+            for sample in (sample_a, sample_b):
+                sample["features"] = torch.from_numpy(self.normalizer.transform(
+                    sample["features"].numpy(), sample["mask"].numpy()))
         return {
-            "a": self.store.get(a), "b": self.store.get(b),
+            "a": sample_a, "b": sample_b,
             "label": torch.tensor(label, dtype=torch.float32),
             "sample_id_a": str(self.index.sample_ids[a]),
             "sample_id_b": str(self.index.sample_ids[b]),
