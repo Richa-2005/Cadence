@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import shutil
 import subprocess
 from time import perf_counter
 
@@ -53,6 +54,30 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def restore_checkpoint(path, model, optimizer, config, device):
+    # Only load checkpoints from our own saved runs: they contain Python/NumPy RNG objects.
+    saved = torch.load(path, map_location='cpu', weights_only=False)
+    previous = saved['config']
+    for key in ('artifact_hashes', 'seed', 'margin', 'pairs_per_epoch', 'batch_size', 'dataset_version'):
+        if previous[key] != config[key]:
+            raise ValueError(f'Resume mismatch: {key}')
+    model.load_state_dict(saved['model'])
+    optimizer.load_state_dict(saved['optimizer'])
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value) and key != 'step':
+                state[key] = value.to(device)
+    # Explicit CLI rate overrides the old optimizer's rate.
+    for group in optimizer.param_groups:
+        group['lr'] = config['lr']
+    torch.set_rng_state(saved['torch_rng'])
+    np.random.set_state(saved['numpy_rng'])
+    random.setstate(saved['python_rng'])
+    if device.type == 'cuda' and saved['cuda_rng']:
+        torch.cuda.set_rng_state_all(saved['cuda_rng'])
+    return saved
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--processed-dir', type=Path, required=True)
@@ -60,7 +85,8 @@ def main():
     p.add_argument('--normalizer-path', type=Path, required=True)
     p.add_argument('--val-pairs-path', type=Path, required=True)
     p.add_argument('--output-dir', type=Path, required=True)
-    p.add_argument('--epochs', type=int, default=3)
+    p.add_argument('--epochs', type=int, default=3, help='Additional epochs for a resumed run')
+    p.add_argument('--resume', type=Path, help='Trusted checkpoint from your own saved run')
     p.add_argument('--pairs-per-epoch', type=int, default=10000)
     p.add_argument('--batch-size', type=int, default=128)
     p.add_argument('--lr', type=float, default=1e-3)
@@ -102,10 +128,26 @@ def main():
                   torch_version=str(torch.__version__), protocol='aalto_only_pilot',
                   artifact_hashes={k: sha256(getattr(args, k)) for k in
                                    ('split_path', 'normalizer_path', 'val_pairs_path')})
+    best, history, start_epoch = float('inf'), [], 0
+    if args.resume is not None:
+        saved = restore_checkpoint(args.resume, model, optimizer, config, device)
+        start_epoch, best, history = saved['epoch'], saved['best_val_eer'], list(saved['history'])
+        # Carry forward the historical best even if continuation never improves.
+        parent_best = args.resume
+        if saved['history'][-1]['val']['eer'] != best:
+            parent_best = args.resume.parent / 'best.pt'
+            candidate = torch.load(parent_best, map_location='cpu', weights_only=False)
+            if (candidate['history'][-1]['val']['eer'] != best
+                    or candidate['config']['artifact_hashes'] != config['artifact_hashes']):
+                raise ValueError('Missing or incompatible historical best checkpoint')
+        shutil.copyfile(parent_best, args.output_dir / 'best.pt')
+        config['resume_sha256'] = sha256(args.resume)
+        config['start_epoch'] = start_epoch
+        print(f'Resuming after epoch {start_epoch}; lr={args.lr}; best EER={best:.2%}', flush=True)
     (args.output_dir / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
     normalizer.save(args.output_dir / 'normalizer.json')
-    best, history = float('inf'), []
-    for epoch in range(args.epochs):
+    end_epoch = start_epoch + args.epochs
+    for epoch in range(start_epoch, end_epoch):
         train.set_epoch(epoch)
         start = perf_counter()
         training = run_epoch(model, train_loader, criterion, device, optimizer)
@@ -125,10 +167,9 @@ def main():
         torch.save(checkpoint, temporary)
         temporary.replace(args.output_dir / 'last.pt')
         if improved:
-            import shutil
             shutil.copyfile(args.output_dir / 'last.pt', args.output_dir / 'best.pt')
         (args.output_dir / 'history.json').write_text(json.dumps(history, indent=2) + '\n')
-        print(f"Epoch {epoch+1}/{args.epochs}: train_loss={training['loss']:.4f} "
+        print(f"Epoch {epoch+1}/{end_epoch}: train_loss={training['loss']:.4f} "
               f"val_loss={validation['loss']:.4f} val_EER={validation['eer']:.2%} "
               f"FAR={validation['far']:.2%} FRR={validation['frr']:.2%} "
               f"seconds={row['seconds']:.1f}", flush=True)

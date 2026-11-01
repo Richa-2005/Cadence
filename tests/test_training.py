@@ -58,3 +58,22 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(best['best_val_eer'], min(row['val']['eer'] for row in history))
             self.assertIn('normalizer', checkpoint)
             self.assertIn('artifact_hashes', checkpoint['config'])
+
+            command = list(result.args)
+            command[command.index('--output-dir') + 1] = str(root / 'continued')
+            command[command.index('--epochs') + 1] = '1'
+            command += ['--resume', str(root / 'run/last.pt'), '--lr', '0.0003']
+            resumed = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            continued = torch.load(root / 'continued/last.pt', weights_only=False)
+            self.assertEqual(continued['epoch'], 3)
+            self.assertEqual(len(continued['history']), 3)
+            self.assertEqual(continued['optimizer']['param_groups'][0]['lr'], .0003)
+            self.assertTrue((root / 'continued/best.pt').exists())
+            self.assertIn('resume_sha256', continued['config'])
+            bad_command = list(command)
+            bad_command[bad_command.index('--output-dir') + 1] = str(root / 'bad')
+            bad_command += ['--seed', '99']
+            rejected = subprocess.run(bad_command, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('Resume mismatch: seed', rejected.stderr)
