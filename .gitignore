@@ -34,3 +34,7 @@ frontend/dist/
 .DS_Store
 
 docs/
+
+# Local model assets and evaluation exports
+/artifacts/
+*.tsbuildinfo
