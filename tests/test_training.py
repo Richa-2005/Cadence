@@ -77,3 +77,21 @@ class TrainingTests(unittest.TestCase):
             rejected = subprocess.run(bad_command, capture_output=True, text=True)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn('Resume mismatch: seed', rejected.stderr)
+
+            mining_command = list(result.args)
+            mining_command[mining_command.index('--output-dir') + 1] = str(root / 'mined')
+            mining_command += ['--negative-sampling', 'hard']
+            mined = subprocess.run(mining_command, capture_output=True, text=True)
+            self.assertEqual(mined.returncode, 0, mined.stderr)
+            mining_checkpoint = torch.load(root / 'mined/last.pt', weights_only=False)
+            self.assertEqual(mining_checkpoint['config']['negative_sampling'], 'hard')
+            self.assertEqual(mining_checkpoint['history'][-1]['train']['pairs'], 16)
+            self.assertGreater(mining_checkpoint['history'][-1]['train']['candidates'], 16)
+            resumed_command = list(mining_command)
+            resumed_command[resumed_command.index('--output-dir') + 1] = str(root / 'mined_resume')
+            resumed_command[resumed_command.index('--epochs') + 1] = '1'
+            resumed_command += ['--resume', str(root / 'mined/last.pt')]
+            mined_resume = subprocess.run(resumed_command, capture_output=True, text=True)
+            self.assertEqual(mined_resume.returncode, 0, mined_resume.stderr)
+            continued_mining = torch.load(root / 'mined_resume/last.pt', weights_only=False)
+            self.assertEqual(continued_mining['epoch'], 3)

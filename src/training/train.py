@@ -18,14 +18,37 @@ from src.data.pair_dataset import PairDataset
 from src.models.encoder import SiameseNetwork
 from src.models.loss import ContrastiveLoss
 from .metrics import verification_metrics
+from .mining import select_pairs
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None):
+def run_epoch(model, loader, criterion, device, optimizer=None, *,
+              negative_sampling='all', selected_batch_size=128, pair_budget=None,
+              seed=42, epoch=0):
     training = optimizer is not None
     model.train(training)
     total_loss, count, distances, labels = 0., 0, [], []
+    candidates = 0
     with torch.set_grad_enabled(training):
-        for batch in loader:
+        for step, batch in enumerate(loader):
+            if training and negative_sampling != 'all' and pair_budget is not None and count >= pair_budget:
+                break
+            candidates += len(batch['label'])
+            if training and negative_sampling != 'all':
+                if pair_budget is not None and count >= pair_budget:
+                    break
+                model.eval()
+                with torch.no_grad():
+                    ca, cb = model(batch['a']['features'].to(device), batch['a']['length'],
+                                   batch['b']['features'].to(device), batch['b']['length'])
+                    scores = torch.linalg.vector_norm(ca - cb, dim=1).cpu().numpy()
+                size = min(selected_batch_size, pair_budget - count) if pair_budget is not None else selected_batch_size
+                selected = select_pairs(batch['label'].numpy(), scores, mode=negative_sampling,
+                                        size=size, seed=seed, epoch=epoch, step=step)
+                if not len(selected):
+                    continue
+                batch = {side: {key: value[selected] for key, value in batch[side].items()}
+                         for side in ('a', 'b')} | {'label': batch['label'][selected]}
+                model.train()
             a, b = model(batch['a']['features'].to(device), batch['a']['length'],
                          batch['b']['features'].to(device), batch['b']['length'])
             y = batch['label'].to(device)
@@ -44,7 +67,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
                 labels.extend(y.cpu().tolist())
     if not count:
         raise ValueError('Empty loader')
-    result = dict(loss=total_loss / count, pairs=count)
+    result = dict(loss=total_loss / count, pairs=count, candidates=candidates)
     if not training:
         result.update(verification_metrics(distances, labels))
     return result
@@ -89,6 +112,8 @@ def main():
     p.add_argument('--resume', type=Path, help='Trusted checkpoint from your own saved run')
     p.add_argument('--pairs-per-epoch', type=int, default=10000)
     p.add_argument('--batch-size', type=int, default=128)
+    p.add_argument('--negative-sampling', choices=['all', 'random', 'hard'], default='all',
+                   help='all: original sampling; random/hard: balanced selection from 2x candidates')
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--margin', type=float, default=1.)
     p.add_argument('--seed', type=int, default=42)
@@ -97,6 +122,8 @@ def main():
     args = p.parse_args()
     if min(args.epochs, args.pairs_per_epoch, args.batch_size) < 1 or args.seed < 0 or not 0 < args.lr < float('inf'):
         p.error('Invalid epoch, pair, batch, seed or learning-rate setting')
+    if args.negative_sampling != 'all' and (args.batch_size < 2 or args.batch_size % 2 or args.pairs_per_epoch % 2):
+        p.error('Balanced selection requires an even batch size >= 2 and even pair budget')
     # A fresh directory prevents accidental overwrite of previous runs.
     args.output_dir.mkdir(parents=True, exist_ok=False)
     random.seed(args.seed)
@@ -113,11 +140,13 @@ def main():
     val_index = load_pair_index('aalto', 'val', args.processed_dir, args.split_path)
     if set(train_index.subjects) & set(val_index.subjects):
         raise ValueError('Subject leakage')
-    train = PairDataset(train_index, pairs_per_epoch=args.pairs_per_epoch, seed=args.seed,
+    candidate_count = (args.pairs_per_epoch if args.negative_sampling == 'all' else
+                       (((args.pairs_per_epoch + args.batch_size - 1) // args.batch_size) + 8) * args.batch_size * 2)
+    train = PairDataset(train_index, pairs_per_epoch=candidate_count, seed=args.seed,
                         normalizer=normalizer, loading='memory')
     val = PairDataset(val_index, fixed_pairs_path=args.val_pairs_path, split_name='val',
                       normalizer=normalizer, loading='memory')
-    train_loader = DataLoader(train, batch_size=args.batch_size, num_workers=0)
+    train_loader = DataLoader(train, batch_size=args.batch_size * (1 if args.negative_sampling == 'all' else 2), num_workers=0)
     val_loader = DataLoader(val, batch_size=args.batch_size, num_workers=0)
     model = SiameseNetwork().to(device)
     criterion = ContrastiveLoss(args.margin)
@@ -141,6 +170,7 @@ def main():
                     or candidate['config']['artifact_hashes'] != config['artifact_hashes']):
                 raise ValueError('Missing or incompatible historical best checkpoint')
         shutil.copyfile(parent_best, args.output_dir / 'best.pt')
+        config['parent_negative_sampling'] = saved['config'].get('negative_sampling', 'all')
         config['resume_sha256'] = sha256(args.resume)
         config['start_epoch'] = start_epoch
         print(f'Resuming after epoch {start_epoch}; lr={args.lr}; best EER={best:.2%}', flush=True)
@@ -150,7 +180,11 @@ def main():
     for epoch in range(start_epoch, end_epoch):
         train.set_epoch(epoch)
         start = perf_counter()
-        training = run_epoch(model, train_loader, criterion, device, optimizer)
+        training = run_epoch(model, train_loader, criterion, device, optimizer,
+                             negative_sampling=args.negative_sampling, selected_batch_size=args.batch_size,
+                             pair_budget=args.pairs_per_epoch, seed=args.seed, epoch=epoch)
+        if training['pairs'] != args.pairs_per_epoch:
+            raise RuntimeError('Candidate pool exhausted before requested selected-pair budget')
         validation = run_epoch(model, val_loader, criterion, device)
         row = dict(epoch=epoch + 1, train=training, val=validation, seconds=perf_counter() - start)
         history.append(row)
